@@ -1,0 +1,8 @@
+{
+  "name": "Remix جدول الرقية والمتابعة",
+  "description": "تطبيق جدول الرقية الشرعية والمتابعة اليومية للأذكار وسورة البقرة وآيات الشفاء والسكينة وملاحظة الأثر",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
