@@ -1,3 +1,9 @@
+dependencies {
+    // ... dependencies الحالية ...
+    
+    // 🔐 مكتبة التشفير لـ SharedPreferences
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+}
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
 
 plugins {
