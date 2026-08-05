@@ -1,6 +1,8 @@
 dependencies {
-    // ... المكتبات الموجودة ...
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    // ... بقية المكتبات الموجودة ...
 
-    // 🔐 مكتبة التشفير - النسخة المستقرة المتوافقة مع الكود
+    // 🔐 أضف هذا السطر هنا:
     implementation("androidx.security:security-crypto:1.0.0")
 }
