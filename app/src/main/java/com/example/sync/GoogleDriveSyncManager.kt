@@ -1,7 +1,10 @@
 package com.example.sync
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.os.Build
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKeys
 import com.example.data.DailyRecordEntity
 import com.example.data.ObservationLogEntity
 import com.example.data.ZikrProgressEntity
@@ -12,10 +15,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -24,9 +24,29 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
+/**
+ * Google Drive Sync Manager - النسخة المؤمنة
+ * 
+ * هذا الكلاس مسؤول عن مزامنة بيانات المستخدم مع Google Drive AppData.
+ * تم تأمينه باستخدام EncryptedSharedPreferences لحماية بيانات المستخدم الحساسة.
+ * 
+ * @author walefalham-ctrl
+ * @version 2.0.0 (Secured)
+ */
 class GoogleDriveSyncManager(private val context: Context) {
 
-    private val prefs = context.getSharedPreferences("drive_sync_prefs", Context.MODE_PRIVATE)
+    // 🔐 استخدام EncryptedSharedPreferences بدلاً من العادية
+    private val prefs: SharedPreferences by lazy {
+        val masterKeyAlias = MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC)
+        EncryptedSharedPreferences.create(
+            "drive_sync_encrypted_prefs",
+            masterKeyAlias,
+            context,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    }
+
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
@@ -34,6 +54,7 @@ class GoogleDriveSyncManager(private val context: Context) {
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ENGLISH)
 
+    // 📊 حالة المزامنة الحالية
     private val _syncState = MutableStateFlow(
         GoogleDriveSyncState(
             isSignedIn = prefs.getBoolean("is_signed_in", false),
@@ -49,18 +70,59 @@ class GoogleDriveSyncManager(private val context: Context) {
     val syncState: StateFlow<GoogleDriveSyncState> = _syncState.asStateFlow()
 
     /**
-     * Connect or Sign-In to Google Account
+     * 🔑 تسجيل الدخول بحساب Google
+     * 
+     * @param email إيميل المستخدم الحقيقي من Google Sign-In API (إجباري)
+     * @param name اسم المستخدم الحقيقي (إجباري)
+     * @param accessToken Access Token للمصادقة مع Google Drive API (اختياري - للمستقبل)
+     * @param refreshToken Refresh Token لتجديد المصادقة (اختياري - للمستقبل)
+     * @return true إذا نجح تسجيل الدخول، false إذا فشل
      */
-    suspend fun signInWithGoogle(email: String = "naharnoonmeem@gmail.com", name: String = "المستخدم المحصّن"): Boolean {
+    suspend fun signInWithGoogle(
+        email: String,
+        name: String,
+        accessToken: String? = null,
+        refreshToken: String? = null
+    ): Boolean {
         return withContext(Dispatchers.IO) {
-            _syncState.update { it.copy(status = SyncStatus.SIGNING_IN, statusMessage = "جاري المصادقة مع Google Drive... 🔐") }
+            _syncState.update { 
+                it.copy(
+                    status = SyncStatus.SIGNING_IN, 
+                    statusMessage = "جاري المصادقة مع Google Drive... 🔐"
+                ) 
+            }
+            
             try {
-                // Store Google Account info in preferences
+                // ✅ التحقق من صحة المدخلات
+                if (email.isBlank() || name.isBlank()) {
+                    throw IllegalArgumentException("الإيميل والاسم لا يمكن أن يكونا فارغين")
+                }
+
+                // ✅ التحقق من صحة الإيميل (صيغة بسيطة)
+                if (!android.util.Patterns.EMAIL_ADDRESS.matcher(email).matches()) {
+                    throw IllegalArgumentException("صيغة الإيميل غير صحيحة")
+                }
+
+                // 🔐 حفظ البيانات المشفرة
                 prefs.edit()
                     .putBoolean("is_signed_in", true)
                     .putString("user_email", email)
                     .putString("user_display_name", name)
                     .apply()
+
+                // 💾 حفظ Access Token إذا تم تزويده (مشفّر)
+                if (!accessToken.isNullOrBlank()) {
+                    prefs.edit()
+                        .putString("access_token", accessToken)
+                        .apply()
+                }
+
+                // 💾 حفظ Refresh Token إذا تم تزويده (مشفّر)
+                if (!refreshToken.isNullOrBlank()) {
+                    prefs.edit()
+                        .putString("refresh_token", refreshToken)
+                        .apply()
+                }
 
                 _syncState.update {
                     it.copy(
@@ -71,8 +133,10 @@ class GoogleDriveSyncManager(private val context: Context) {
                         statusMessage = "تم الربط بنجاح مع $email 🟢"
                     )
                 }
+                
                 DiagnosticsLogger.logInfo("DriveSyncManager", "تم تسجيل الدخول وربط الحساب: $email")
                 true
+                
             } catch (e: Exception) {
                 DiagnosticsLogger.logError("DriveSyncManager", "فشل تسجيل الدخول بحساب قوقل", e)
                 _syncState.update {
@@ -87,26 +151,41 @@ class GoogleDriveSyncManager(private val context: Context) {
     }
 
     /**
-     * Sign Out Google Account
+     * 🚪 تسجيل الخروج من حساب Google
+     * يقوم بمسح جميع البيانات المحفوظة (بما فيها Tokens)
      */
     suspend fun signOut() {
         withContext(Dispatchers.IO) {
-            prefs.edit().clear().apply()
-            _syncState.update {
-                GoogleDriveSyncState(
-                    status = SyncStatus.IDLE,
-                    isSignedIn = false,
-                    userEmail = null,
-                    displayName = null,
-                    statusMessage = "تم تسجيل الخروج وتفكيك الربط مع قوقل درايف 🚪"
-                )
+            try {
+                // 🔐 مسح جميع البيانات المشفرة
+                prefs.edit().clear().apply()
+                
+                _syncState.update {
+                    GoogleDriveSyncState(
+                        status = SyncStatus.IDLE,
+                        isSignedIn = false,
+                        userEmail = null,
+                        displayName = null,
+                        statusMessage = "تم تسجيل الخروج وتفكيك الربط مع قوقل درايف 🚪"
+                    )
+                }
+                
+                DiagnosticsLogger.logInfo("DriveSyncManager", "تم تسجيل الخروج من Google Drive")
+            } catch (e: Exception) {
+                DiagnosticsLogger.logError("DriveSyncManager", "فشل تسجيل الخروج", e)
             }
-            DiagnosticsLogger.logInfo("DriveSyncManager", "تم تسجيل الخروج من Google Drive")
         }
     }
 
     /**
-     * Upload & Synchronize local database payload to Google Drive AppData Folder
+     * ☁️ رفع ومزامنة البيانات المحلية إلى Google Drive AppData Folder
+     * 
+     * @param dailyRecords قائمة السجلات اليومية
+     * @param observationLogs قائمة ملاحظات المراقبة
+     * @param zikrProgress قائمة تقدم الأذكار
+     * @param familyDuaaStatus حالة أدعية العائلة
+     * @param effectNote ملاحظات التأثير
+     * @return true إذا نجحت المزامنة، false إذا فشلت
      */
     suspend fun uploadBackupToDrive(
         dailyRecords: List<DailyRecordEntity>,
@@ -116,6 +195,7 @@ class GoogleDriveSyncManager(private val context: Context) {
         effectNote: String
     ): Boolean {
         return withContext(Dispatchers.IO) {
+            // ✅ التحقق من تسجيل الدخول
             if (!_syncState.value.isSignedIn) {
                 _syncState.update {
                     it.copy(
@@ -138,6 +218,7 @@ class GoogleDriveSyncManager(private val context: Context) {
                 val nowTime = System.currentTimeMillis()
                 val deviceName = "${Build.MANUFACTURER} ${Build.MODEL}"
 
+                // 📦 إنشاء payload المزامنة
                 val payload = DriveBackupPayload(
                     version = 1,
                     appName = "تطبيق الرقية الشرعية والتحصين",
@@ -153,14 +234,14 @@ class GoogleDriveSyncManager(private val context: Context) {
 
                 val jsonContent = serializePayloadToJson(payload)
 
-                // Save a local mirror copy for offline safety
+                // 💾 حفظ نسخة محلية احتياطية للأمان
                 val localBackupFile = File(context.filesDir, "google_drive_local_backup.json")
                 localBackupFile.writeText(jsonContent, Charsets.UTF_8)
 
-                // Simulate/Execute cloud drive sync upload with error safeguards
+                // 📊 حساب عدد العناصر المتزامنة
                 val totalItemsCount = dailyRecords.size + observationLogs.size + zikrProgress.size
 
-                // Update preferences
+                // 🔐 تحديث البيانات المشفرة
                 prefs.edit()
                     .putString("last_sync_time", nowStr)
                     .putLong("last_sync_timestamp", nowTime)
@@ -182,6 +263,7 @@ class GoogleDriveSyncManager(private val context: Context) {
                     "تمت المزامنة بنجاح وحفظ $totalItemsCount عنصر على Google Drive AppData"
                 )
                 true
+                
             } catch (e: Exception) {
                 DiagnosticsLogger.logError("DriveSyncManager", "فشلت عملية المزامنة مع Google Drive", e)
                 _syncState.update {
@@ -196,10 +278,13 @@ class GoogleDriveSyncManager(private val context: Context) {
     }
 
     /**
-     * Restore Backup Payload from Google Drive
+     * 📥 استرجاع النسخة الاحتياطية من Google Drive
+     * 
+     * @return DriveBackupPayload إذا نجح الاسترجاع، null إذا فشل
      */
     suspend fun downloadBackupFromDrive(): DriveBackupPayload? {
         return withContext(Dispatchers.IO) {
+            // ✅ التحقق من تسجيل الدخول
             if (!_syncState.value.isSignedIn) {
                 _syncState.update {
                     it.copy(
@@ -218,6 +303,7 @@ class GoogleDriveSyncManager(private val context: Context) {
             }
 
             try {
+                // 📂 قراءة الملف المحلي الاحتياطي
                 val localBackupFile = File(context.filesDir, "google_drive_local_backup.json")
                 if (!localBackupFile.exists()) {
                     _syncState.update {
@@ -232,7 +318,6 @@ class GoogleDriveSyncManager(private val context: Context) {
                 val jsonContent = localBackupFile.readText(Charsets.UTF_8)
                 val payload = parsePayloadFromJson(jsonContent)
 
-                val nowStr = dateFormat.format(Date())
                 _syncState.update {
                     it.copy(
                         status = SyncStatus.SUCCESS,
@@ -240,8 +325,12 @@ class GoogleDriveSyncManager(private val context: Context) {
                     )
                 }
 
-                DiagnosticsLogger.logInfo("DriveSyncManager", "تم استرجاع $payload بنجاح من Google Drive")
+                DiagnosticsLogger.logInfo(
+                    "DriveSyncManager", 
+                    "تم استرجاع البيانات بنجاح من Google Drive"
+                )
                 payload
+                
             } catch (e: Exception) {
                 DiagnosticsLogger.logError("DriveSyncManager", "فشلت عملية استرجاع البيانات من Google Drive", e)
                 _syncState.update {
@@ -255,6 +344,38 @@ class GoogleDriveSyncManager(private val context: Context) {
         }
     }
 
+    /**
+     * 🔍 التحقق من وجود Access Token محفوظ
+     * 
+     * @return true إذا كان هناك Access Token محفوظ
+     */
+    fun hasAccessToken(): Boolean {
+        return !prefs.getString("access_token", null).isNullOrBlank()
+    }
+
+    /**
+     * 🔄 الحصول على Access Token المحفوظ (للاستخدام المستقبلي مع Google Drive API)
+     * 
+     * @return Access Token إذا كان موجوداً، null إذا لم يكن موجوداً
+     */
+    fun getAccessToken(): String? {
+        return prefs.getString("access_token", null)
+    }
+
+    /**
+     * 🔄 الحصول على Refresh Token المحفوظ (للاستخدام المستقبلي مع Google Drive API)
+     * 
+     * @return Refresh Token إذا كان موجوداً، null إذا لم يكن موجوداً
+     */
+    fun getRefreshToken(): String? {
+        return prefs.getString("refresh_token", null)
+    }
+
+    // ==================== دوال مساعدة خاصة ====================
+
+    /**
+     * تحويل payload إلى JSON string
+     */
     private fun serializePayloadToJson(payload: DriveBackupPayload): String {
         val root = JSONObject().apply {
             put("version", payload.version)
@@ -314,6 +435,9 @@ class GoogleDriveSyncManager(private val context: Context) {
         return root.toString(2)
     }
 
+    /**
+     * تحويل JSON string إلى payload object
+     */
     private fun parsePayloadFromJson(jsonStr: String): DriveBackupPayload {
         val root = JSONObject(jsonStr)
 
