@@ -36,6 +36,7 @@ import java.util.concurrent.TimeUnit
 class GoogleDriveSyncManager(private val context: Context) {
 
     // 🔐 استخدام EncryptedSharedPreferences بدلاً من العادية
+    // يجب تعريفه أولاً قبل استخدامه في _syncState
     private val prefs: SharedPreferences by lazy {
         val masterKeyAlias = MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC)
         EncryptedSharedPreferences.create(
@@ -55,19 +56,25 @@ class GoogleDriveSyncManager(private val context: Context) {
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ENGLISH)
 
     // 📊 حالة المزامنة الحالية
-    private val _syncState = MutableStateFlow(
-        GoogleDriveSyncState(
-            isSignedIn = prefs.getBoolean("is_signed_in", false),
-            userEmail = prefs.getString("user_email", null),
-            displayName = prefs.getString("user_display_name", null),
-            lastSyncTime = prefs.getString("last_sync_time", "لم تتم المزامنة بعد"),
-            lastSyncTimestamp = prefs.getLong("last_sync_timestamp", 0L),
-            statusMessage = if (prefs.getBoolean("is_signed_in", false))
-                "متصل بحساب قوقل جاهز للمزامنة 🟢"
-            else "غير مرتبط بدرايف ☁️"
+    // استخدام by lazy للتأكد من أن prefs جاهز قبل الاستخدام
+    private val _syncState: MutableStateFlow<GoogleDriveSyncState> by lazy {
+        MutableStateFlow(
+            GoogleDriveSyncState(
+                isSignedIn = prefs.getBoolean("is_signed_in", false),
+                userEmail = prefs.getString("user_email", null),
+                displayName = prefs.getString("user_display_name", null),
+                lastSyncTime = prefs.getString("last_sync_time", "لم تتم المزامنة بعد"),
+                lastSyncTimestamp = prefs.getLong("last_sync_timestamp", 0L),
+                statusMessage = if (prefs.getBoolean("is_signed_in", false))
+                    "متصل بحساب قوقل جاهز للمزامنة 🟢"
+                else "غير مرتبط بدرايف ☁️"
+            )
         )
-    )
-    val syncState: StateFlow<GoogleDriveSyncState> = _syncState.asStateFlow()
+    }
+    
+    val syncState: StateFlow<GoogleDriveSyncState> by lazy { 
+        _syncState.asStateFlow() 
+    }
 
     /**
      * 🔑 تسجيل الدخول بحساب Google
