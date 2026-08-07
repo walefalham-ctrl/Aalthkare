@@ -1,365 +1,190 @@
-package com.example.sync
+import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
 
-import android.content.Context
-import android.os.Build
-import com.example.data.DailyRecordEntity
-import com.example.data.ObservationLogEntity
-import com.example.data.ZikrProgressEntity
-import com.example.utils.DiagnosticsLogger
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.google.devtools.ksp)
+    alias(libs.plugins.roborazzi)
+    alias(libs.plugins.secrets)
+    alias(libs.plugins.google.services)
+}
 
-class GoogleDriveSyncManager(private val context: Context) {
+android {
+    namespace = "com.example"
+    compileSdk = 36
 
-    private val prefs by lazy {
-        context.getSharedPreferences("drive_sync_prefs", Context.MODE_PRIVATE)
+    defaultConfig {
+        applicationId = "com.aistudio.ruqyah.eysosm"
+        minSdk = 24
+        targetSdk = 36
+        versionCode = 1
+        versionName = "1.0"
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        vectorDrawables.useSupportLibrary = true
     }
 
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ENGLISH)
+    signingConfigs {
+        create("release") {
+            val keystorePath = System.getenv("KEYSTORE_PATH")
+                ?: file("${rootDir}/my-upload-key.jks").absolutePath
+            
+            storeFile = file(keystorePath)
+            storePassword = System.getenv("STORE_PASSWORD") ?: ""
+            keyAlias = System.getenv("KEY_ALIAS") ?: "upload"
+            keyPassword = System.getenv("KEY_PASSWORD") ?: ""
 
-    private val _syncState: MutableStateFlow<GoogleDriveSyncState> by lazy {
-        MutableStateFlow(
-            GoogleDriveSyncState(
-                isSignedIn = prefs.getBoolean("is_signed_in", false),
-                userEmail = prefs.getString("user_email", null),
-                displayName = prefs.getString("user_display_name", null),
-                lastSyncTime = prefs.getString("last_sync_time", "لم تتم المزامنة بعد"),
-                lastSyncTimestamp = prefs.getLong("last_sync_timestamp", 0L),
-                statusMessage = if (prefs.getBoolean("is_signed_in", false))
-                    "متصل بحساب قوقل جاهز للمزامنة 🟢"
-                else "غير مرتبط بدرايف ☁️"
+            // تأكد من وجود الملف قبل الاستخدام
+            if (!storeFile.exists()) {
+                logger.warn("⚠️ Keystore file not found at: $keystorePath")
+            }
+        }
+        
+        create("debugConfig") {
+            storeFile = file("${rootDir}/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
             )
-        )
-    }
-
-    val syncState: StateFlow<GoogleDriveSyncState> by lazy { _syncState.asStateFlow() }
-
-    suspend fun signInWithGoogle(
-        email: String = "user@device.local",
-        name: String = "مستخدم التطبيق المحصّن"
-    ): Boolean {
-        return withContext(Dispatchers.IO) {
-            _syncState.update {
-                it.copy(status = SyncStatus.SIGNING_IN, statusMessage = "جاري المصادقة مع Google Drive... 🔐")
-            }
-
-            try {
-                if (email.isBlank() || name.isBlank()) {
-                    throw IllegalArgumentException("الإيميل والاسم لا يمكن أن يكونا فارغين")
-                }
-
-                if (!android.util.Patterns.EMAIL_ADDRESS.matcher(email).matches()) {
-                    throw IllegalArgumentException("صيغة الإيميل غير صحيحة")
-                }
-
-                prefs.edit()
-                    .putBoolean("is_signed_in", true)
-                    .putString("user_email", email)
-                    .putString("user_display_name", name)
-                    .apply()
-
-                _syncState.update {
-                    it.copy(
-                        status = SyncStatus.IDLE,
-                        isSignedIn = true,
-                        userEmail = email,
-                        displayName = name,
-                        statusMessage = "تم الربط بنجاح 🟢"
-                    )
-                }
-
-                DiagnosticsLogger.logInfo("DriveSyncManager", "تم تسجيل الدخول وربط الحساب بنجاح")
-                true
-
-            } catch (e: Exception) {
-                DiagnosticsLogger.logError("DriveSyncManager", "فشل تسجيل الدخول بحساب قوقل", e)
-                _syncState.update {
-                    it.copy(
-                        status = SyncStatus.ERROR,
-                        statusMessage = "فشل الربط بالحساب: ${e.localizedMessage ?: "خطأ غير معروف"} 🔴"
-                    )
-                }
-                false
-            }
+            signingConfig = signingConfigs.getByName("release")
+            
+            // إضافة لدعم R8
+            ndk.debugSymbolLevel = "FULL"
+        }
+        
+        debug {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debugConfig")
+            isDebuggable = true
         }
     }
 
-    suspend fun signOut() {
-        withContext(Dispatchers.IO) {
-            try {
-                prefs.edit().clear().apply()
-                _syncState.update {
-                    GoogleDriveSyncState(
-                        status = SyncStatus.IDLE,
-                        isSignedIn = false,
-                        userEmail = null,
-                        displayName = null,
-                        statusMessage = "تم تسجيل الخروج وتفكيك الربط مع قوقل درايف 🚪"
-                    )
-                }
-                DiagnosticsLogger.logInfo("DriveSyncManager", "تم تسجيل الخروج من Google Drive")
-            } catch (e: Exception) {
-                DiagnosticsLogger.logError("DriveSyncManager", "فشل تسجيل الخروج", e)
-            }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
+
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+            isReturnDefaultValues = true
         }
     }
 
-    suspend fun uploadBackupToDrive(
-        dailyRecords: List<DailyRecordEntity>,
-        observationLogs: List<ObservationLogEntity>,
-        zikrProgress: List<ZikrProgressEntity>,
-        familyDuaaStatus: Map<String, Boolean>,
-        effectNote: String
-    ): Boolean {
-        return withContext(Dispatchers.IO) {
-            if (!_syncState.value.isSignedIn) {
-                _syncState.update {
-                    it.copy(status = SyncStatus.ERROR, statusMessage = "يرجى تسجيل الدخول بحساب Google أولاً! ⚠️")
-                }
-                return@withContext false
-            }
-
-            _syncState.update {
-                it.copy(status = SyncStatus.SYNCING, statusMessage = "جاري رفع النسخة الاحتياطية... ☁️")
-            }
-
-            try {
-                val nowStr = dateFormat.format(Date())
-                val nowTime = System.currentTimeMillis()
-                val deviceName = "${Build.MANUFACTURER} ${Build.MODEL}"
-
-                val payload = DriveBackupPayload(
-                    version = 1,
-                    appName = "تطبيق الرقية الشرعية والتحصين",
-                    exportDate = nowStr,
-                    timestamp = nowTime,
-                    deviceModel = deviceName,
-                    dailyRecords = dailyRecords,
-                    observationLogs = observationLogs,
-                    zikrProgress = zikrProgress,
-                    familyDuaaStatus = familyDuaaStatus,
-                    currentEffectNote = effectNote
-                )
-
-                val jsonContent = serializePayloadToJson(payload)
-                val localBackupFile = File(context.filesDir, "google_drive_local_backup.json")
-                localBackupFile.writeText(jsonContent, Charsets.UTF_8)
-
-                val totalItemsCount = dailyRecords.size + observationLogs.size + zikrProgress.size
-
-                prefs.edit()
-                    .putString("last_sync_time", nowStr)
-                    .putLong("last_sync_timestamp", nowTime)
-                    .putInt("last_backup_count", totalItemsCount)
-                    .apply()
-
-                _syncState.update {
-                    it.copy(
-                        status = SyncStatus.SUCCESS,
-                        lastSyncTime = nowStr,
-                        lastSyncTimestamp = nowTime,
-                        backupFileCount = totalItemsCount,
-                        statusMessage = "تمت المزامنة والرفع بنجاح! ☁️🟢 ($totalItemsCount عنصر)"
-                    )
-                }
-
-                DiagnosticsLogger.logInfo("DriveSyncManager", "تمت المزامنة بنجاح وحفظ $totalItemsCount عنصر")
-                true
-
-            } catch (e: Exception) {
-                DiagnosticsLogger.logError("DriveSyncManager", "فشلت عملية المزامنة مع Google Drive", e)
-                _syncState.update {
-                    it.copy(status = SyncStatus.ERROR, statusMessage = "فشلت المزامنة: ${e.localizedMessage ?: "انقطع الاتصال بالشبكة"} 🔴")
-                }
-                false
-            }
-        }
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = true
     }
+}
 
-    suspend fun downloadBackupFromDrive(): DriveBackupPayload? {
-        return withContext(Dispatchers.IO) {
-            if (!_syncState.value.isSignedIn) {
-                _syncState.update {
-                    it.copy(status = SyncStatus.ERROR, statusMessage = "يرجى تسجيل الدخول بحساب Google أولاً! ⚠️")
-                }
-                return@withContext null
-            }
+// Configure the Secrets Gradle Plugin
+secrets {
+    propertiesFileName = ".env"
+    defaultPropertiesFileName = ".env.example"
+    ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
+}
 
-            _syncState.update {
-                it.copy(status = SyncStatus.RESTORING, statusMessage = "جاري استرجاع أحدث نسخة من Google Drive... 🔄")
-            }
+// يجب أن يكون ERROR وليس WARN
+googleServices {
+    missingGoogleServicesStrategy = MissingGoogleServicesStrategy.ERROR
+}
 
-            try {
-                val localBackupFile = File(context.filesDir, "google_drive_local_backup.json")
-                if (!localBackupFile.exists()) {
-                    _syncState.update {
-                        it.copy(status = SyncStatus.ERROR, statusMessage = "لم يتم العثور على نسخة احتياطية سابقة ⚠️")
-                    }
-                    return@withContext null
-                }
+dependencies {
+    // BOM Platforms
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(platform(libs.firebase.bom))
 
-                val jsonContent = localBackupFile.readText(Charsets.UTF_8)
-                val payload = parsePayloadFromJson(jsonContent)
+    // Core Android
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
 
-                val recordCount = payload?.dailyRecords?.size ?: 0
-                _syncState.update {
-                    it.copy(
-                        status = SyncStatus.SUCCESS,
-                        statusMessage = "تم استرجاع البيانات بنجاح! 🔄🟢 ($recordCount سجل يومي)"
-                    )
-                }
+    // Compose UI
+    implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.ui.graphics)
+    implementation(libs.androidx.compose.ui.tooling.preview)
+    implementation(libs.androidx.compose.material3)
+    implementation(libs.androidx.compose.material.icons.core)
+    implementation(libs.androidx.compose.material.icons.extended)
 
-                DiagnosticsLogger.logInfo("DriveSyncManager", "تم استرجاع البيانات بنجاح من Google Drive")
-                payload
+    // Room Database
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
 
-            } catch (e: Exception) {
-                DiagnosticsLogger.logError("DriveSyncManager", "فشلت عملية استرجاع البيانات من Google Drive", e)
-                _syncState.update {
-                    it.copy(status = SyncStatus.ERROR, statusMessage = "فشل الاسترجاع: ${e.localizedMessage ?: "ملف النسخة تالف"} 🔴")
-                }
-                null
-            }
-        }
-    }
+    // Firebase
+    implementation(libs.firebase.ai)
+    implementation(libs.firebase.appcheck.recaptcha)
+    // implementation(libs.firebase.firestore) // أزل التعليق عند الحاجة
 
-    private fun serializePayloadToJson(payload: DriveBackupPayload): String {
-        val root = JSONObject().apply {
-            put("version", payload.version)
-            put("appName", payload.appName)
-            put("exportDate", payload.exportDate)
-            put("timestamp", payload.timestamp)
-            put("deviceModel", payload.deviceModel)
-            put("currentEffectNote", payload.currentEffectNote)
+    // Google Sign-In & Drive Sync
+    implementation(libs.androidx.credentials)
+    implementation(libs.androidx.credentials.play.services)
+    implementation(libs.googleid)
+    implementation(libs.play.services.auth)
 
-            val duaaObj = JSONObject()
-            payload.familyDuaaStatus.forEach { (k, v) -> duaaObj.put(k, v) }
-            put("familyDuaaStatus", duaaObj)
+    // Networking
+    implementation(libs.retrofit)
+    implementation(libs.converter.moshi)
+    implementation(libs.moshi.kotlin)
+    implementation(libs.okhttp)
+    implementation(libs.logging.interceptor)
+    ksp(libs.moshi.kotlin.codegen)
 
-            val dailyArr = JSONArray()
-            payload.dailyRecords.forEach { rec ->
-                dailyArr.put(JSONObject().apply {
-                    put("date", rec.date)
-                    put("azkarDone", rec.azkarDone)
-                    put("baqarahDone", rec.baqarahDone)
-                    put("ruqyahDone", rec.ruqyahDone)
-                    put("sadakahDone", rec.sadakahDone)
-                    put("wirdDone", rec.wirdDone)
-                    put("namesDone", rec.namesDone)
-                    put("effectNote", rec.effectNote)
-                    put("timestamp", rec.timestamp)
-                })
-            }
-            put("dailyRecords", dailyArr)
+    // Coroutines
+    implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.kotlinx.coroutines.android)
 
-            val logsArr = JSONArray()
-            payload.observationLogs.forEach { log ->
-                logsArr.put(JSONObject().apply {
-                    put("id", log.id)
-                    put("date", log.date)
-                    put("timestamp", log.timestamp)
-                    put("moodTag", log.moodTag)
-                    put("notes", log.notes)
-                    put("sessionType", log.sessionType)
-                })
-            }
-            put("observationLogs", logsArr)
+    // Testing
+    testImplementation(libs.junit)
+    testImplementation(libs.androidx.junit)
+    testImplementation(libs.androidx.core)
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.roborazzi)
+    testImplementation(libs.roborazzi.compose)
+    testImplementation(libs.roborazzi.junit.rule)
+    testImplementation(libs.androidx.compose.ui.test.junit4)
 
-            val zikrArr = JSONArray()
-            payload.zikrProgress.forEach { z ->
-                zikrArr.put(JSONObject().apply {
-                    put("id", z.id)
-                    put("date", z.date)
-                    put("count", z.count)
-                })
-            }
-            put("zikrProgress", zikrArr)
-        }
-        return root.toString(2)
-    }
+    // Android Test
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation(libs.androidx.runner)
+    androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
 
-    private fun parsePayloadFromJson(jsonStr: String): DriveBackupPayload? {
-        return try {
-            val root = JSONObject(jsonStr)
+    // Debug
+    debugImplementation(libs.androidx.compose.ui.tooling)
+    debugImplementation(libs.androidx.compose.ui.test.manifest)
+}
 
-            val dailyList = mutableListOf<DailyRecordEntity>()
-            val dailyArr = root.optJSONArray("dailyRecords") ?: JSONArray()
-            for (i in 0 until dailyArr.length()) {
-                val obj = dailyArr.getJSONObject(i)
-                dailyList.add(
-                    DailyRecordEntity(
-                        date = obj.getString("date"),
-                        azkarDone = obj.optBoolean("azkarDone", false),
-                        baqarahDone = obj.optBoolean("baqarahDone", false),
-                        ruqyahDone = obj.optBoolean("ruqyahDone", false),
-                        sadakahDone = obj.optBoolean("sadakahDone", false),
-                        wirdDone = obj.optBoolean("wirdDone", false),
-                        namesDone = obj.optBoolean("namesDone", false),
-                        effectNote = obj.optString("effectNote", ""),
-                        timestamp = obj.optLong("timestamp", System.currentTimeMillis())
-                    )
-                )
-            }
-
-            val logsList = mutableListOf<ObservationLogEntity>()
-            val logsArr = root.optJSONArray("observationLogs") ?: JSONArray()
-            for (i in 0 until logsArr.length()) {
-                val obj = logsArr.getJSONObject(i)
-                logsList.add(
-                    ObservationLogEntity(
-                        id = obj.optInt("id", 0),
-                        date = obj.optString("date", ""),
-                        timestamp = obj.optLong("timestamp", System.currentTimeMillis()),
-                        moodTag = obj.optString("moodTag", "سكينة وراحة 🌿"),
-                        notes = obj.optString("notes", ""),
-                        sessionType = obj.optString("sessionType", "جلسة رقية واستشفاء")
-                    )
-                )
-            }
-
-            val zikrList = mutableListOf<ZikrProgressEntity>()
-            val zikrArr = root.optJSONArray("zikrProgress") ?: JSONArray()
-            for (i in 0 until zikrArr.length()) {
-                val obj = zikrArr.getJSONObject(i)
-                zikrList.add(
-                    ZikrProgressEntity(
-                        id = obj.getString("id"),
-                        date = obj.getString("date"),
-                        count = obj.optInt("count", 0)
-                    )
-                )
-            }
-
-            val duaaMap = mutableMapOf<String, Boolean>()
-            val duaaObj = root.optJSONObject("familyDuaaStatus")
-            duaaObj?.keys()?.forEach { k ->
-                duaaMap[k] = duaaObj.optBoolean(k, false)
-            }
-
-            DriveBackupPayload(
-                version = root.optInt("version", 1),
-                appName = root.optString("appName", "تطبيق الرقية الشرعية"),
-                exportDate = root.optString("exportDate", ""),
-                timestamp = root.optLong("timestamp", System.currentTimeMillis()),
-                deviceModel = root.optString("deviceModel", "Android Device"),
-                dailyRecords = dailyList,
-                observationLogs = logsList,
-                zikrProgress = zikrList,
-                familyDuaaStatus = duaaMap,
-                currentEffectNote = root.optString("currentEffectNote", "")
-            )
-        } catch (e: Exception) {
-            DiagnosticsLogger.logError("DriveSyncManager", "فشل تحليل JSON: ${e.message}", e)
-            null
+// تحسينات إضافية
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        // تعطيل معالجة PNG للسلالات release فقط
+        if (variant.buildType == "release") {
+            variant.androidResources.aaptOptions.additionalParameters += "--no-crunch"
         }
     }
 }
